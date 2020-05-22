@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <stdbool.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/epoll.h>
@@ -35,6 +36,7 @@ typedef struct thread_pool {
 	thread_worker_t *tail;
 	int cur_queue_size;	
 	int max_thread_num;
+	int working_cnt;
 
 	int shutdown;
 	pthread_t *threadid;
@@ -52,17 +54,19 @@ typedef struct event {
 
 
 typedef struct connections {
+	bool used_bit;
 	event_t *read;
 	event_t *write;
+	event_t *rdhup;
 } connections_t;
 
 typedef struct manager {
 	int ep_fd;
 	struct epoll_event *ep_events;
-	//int nep_events;
+	int max_ep_events;
 
 	connections_t *conn;
-	//int nconnections;
+	int nconnections;
 
 	thread_pool_t *pool;
 
@@ -83,7 +87,6 @@ void add_conn(int sock_fd, int events, void *arg);
 void *accept_connect(void *arg);
 void process_conn(int sock_fd, int events, void *arg);
 
-thread_pool_t *queue_init(int max_num);
 thread_pool_t *queue_init(int max_num);
 int queue_free(thread_pool_t *queue);
 int queue_enqueue(thread_pool_t *queue, void *work, void *args);
@@ -135,6 +138,9 @@ void event_add(int ep_fd, int events, event_t *ev, int et_flag)
 	if (ep_event.events & EPOLLOUT) {
 		printf("EPOLLOUT ");
     }
+	if (ep_event.events & EPOLLRDHUP) {
+		printf("EPOLLRDHUP ");
+    }
 	printf("fd:%d\n", ev->ev_fd);
 
 	if (epoll_ctl(ep_fd, option, ev->ev_fd, &ep_event) < 0) {
@@ -164,8 +170,10 @@ void conn_init(connections_t *c, int size)
 {
 	int i;
 	for (i = 0; i < size; i++) {
+		c[i].used_bit = 0;
 		c[i].read = NULL;
 		c[i].write = NULL;
+		c[i].rdhup = NULL;
 	}
 }
 
@@ -213,11 +221,12 @@ void conn_free(int fd)
 		event_del(g_manager.ep_fd, c->write);
 		event_set(c->write, -1, NULL, 0);
 	}
+	c->used_bit = 0;
 }
 
 void add_conn(int sock_fd, int events, void *arg)
 {
-	printf("%s, tcpfd:%d\n", __func__, sock_fd);
+	printf("%s, add accept_connect func to thread pool. tcpfd:%d\n", __func__, sock_fd);
 	int *tcpfd = (int *)malloc(sizeof(int));
 	*tcpfd = sock_fd;
 	//printf("%d\n", *tcpfd);
@@ -232,25 +241,34 @@ void *accept_connect(void *arg)
 	socklen_t client_len;
 	client_len = sizeof(client_addr);
 
-	printf("%s, tcpfd:%d\n", __func__, tcpfd);
-
+	pthread_mutex_lock(&(g_manager.pool->queue_lock));
+	printf("working_cnt:%d, nconnections:%d\n", g_manager.pool->working_cnt, g_manager.nconnections);	
+	if (g_manager.pool->working_cnt >= MAX_THREAD_NUM || g_manager.nconnections >= MAX_THREAD_NUM) {
+		printf("thread is full, can not accept connect, working_cnt:%d, nconnections:%d\n", g_manager.pool->working_cnt, g_manager.nconnections);	
+		return NULL;
+	}  
+	g_manager.nconnections++;
+	pthread_mutex_unlock(&(g_manager.pool->queue_lock));
 	int new_fd = accept(tcpfd, (struct sockaddr* )&client_addr, &client_len);
 	if (new_fd < 0) {
 		perror("accept error");
 		return NULL;
 	}
 	printf("accept tcp client addr %s, connfd:%d\n", inet_ntoa(client_addr.sin_addr), new_fd);
-	conn_set(new_fd, EPOLLIN, (void *)process_conn);
 
+	conn_set(new_fd, EPOLLIN | EPOLLRDHUP, (void *)process_conn);
+
+	printf("work accept_connect func exit, thread:\033[1m\033[43;33m%ld\033[0m\n", pthread_self());
 	return NULL;
 }
 
 void process_conn(int sock_fd, int events, void *arg)
 {
-	printf("%s tcpfd:%d\n", __func__, sock_fd);
+	printf("%s, add connfd:%d work to thread pool\n", __func__, sock_fd);
 	int *tcpfd = (int *)malloc(sizeof(int));
 	*tcpfd = sock_fd;
 	threadpool_add_worker(g_manager.pool, work, (void *)tcpfd);
+	g_manager.conn[sock_fd].used_bit = 1;
 }
 
 
@@ -266,6 +284,8 @@ thread_pool_t *queue_init(int max_num)
 	queue->tail = NULL;
 	queue->cur_queue_size = 0;
 	queue->max_thread_num = max_num;
+
+	queue->working_cnt = 0;
 
 	return queue;
 }
@@ -290,8 +310,9 @@ int queue_enqueue(thread_pool_t *queue, void *work, void *args)
 {
 	thread_worker_t *pwork;
 
+	printf("%s\n", __func__);
 	if (queue->cur_queue_size >= queue->max_thread_num) {
-		printf("queue full\n");
+		printf("queue full, cur_queue_size:%d\n", queue->cur_queue_size);
 		return -1;
 	}
 
@@ -304,8 +325,10 @@ int queue_enqueue(thread_pool_t *queue, void *work, void *args)
 
 	if (queue->head == NULL) {
 		queue->head = pwork;
+		pwork->val = 1;
 	} else {
 		queue->tail->next = pwork;
+		pwork->val++;
 	}
 
 	queue->tail = pwork;
@@ -318,12 +341,12 @@ thread_worker_t *queue_dequeue(thread_pool_t *queue)
 {
 	thread_worker_t *pwork;
 
+	printf("%s\n", __func__);
 	if (queue == NULL)
-	  return NULL;
+		return NULL;
 
-	printf("size: %d\n", queue->cur_queue_size);
 	if (queue->cur_queue_size <= 0) {
-		printf("queue empty\n");
+		printf("queue empty, cur_queue_size:%d\n", queue->cur_queue_size);
 		return NULL;
 	} 
 
@@ -343,7 +366,9 @@ thread_worker_t *queue_dequeue(thread_pool_t *queue)
 int threadpool_add_worker(thread_pool_t *pool, void *(*work)(void *args), void *args)
 {
 	pthread_mutex_lock(&(pool->queue_lock)); 
+	printf("%s func address:%p\n", __func__, work);
 	queue_enqueue(pool, work, args);
+	pool->working_cnt++;
 	pthread_mutex_unlock(&(pool->queue_lock));
 	pthread_cond_signal(&(pool->queue_ready));
 
@@ -383,30 +408,38 @@ void* thread_routine(void *args)
 
 	while (1) {    
 		pthread_mutex_lock(&(pool->queue_lock));
-		printf("cur_queue_size:%d\n", pool->cur_queue_size);
-		while (pool->cur_queue_size == 0 && !pool->shutdown) {
-			printf("thread %ld is waiting\n", pthread_self());
+		while ((pool->cur_queue_size == 0 || pool->working_cnt == 0) && !pool->shutdown) {
+			printf("thread %ld is waiting..., working_cnt:%d\n", pthread_self(), pool->working_cnt);
 			pthread_cond_wait(&(pool->queue_ready), &(pool->queue_lock));
+			printf("thread %ld is go...\n", pthread_self());
 		}	
 
-		if (pool->shutdown)
-		{
+		if (pool->shutdown) {
+			printf("=============!!!! shutdown !!!!===============\n");
 			pthread_mutex_unlock(&(pool->queue_lock));
 			printf("thread %ld will exit\n", pthread_self());
 			pthread_exit (NULL);
 		}
 
-		printf("thread %ld is starting to work\n", pthread_self());
-		assert(pool->cur_queue_size != 0);
-		assert(pool->head != NULL);
+		printf("thread \033[1m\033[42;33m%ld \033[0m is starting to work\n", pthread_self());
 
 		thread_worker_t *worker = queue_dequeue(pool);
+		printf("working_cnt:%d\n", pool->working_cnt);
 		pthread_mutex_unlock(&(pool->queue_lock));
 
-		(*(worker->process_work))(worker->args);
+		if (worker) {
+			(*(worker->process_work))(worker->args);
 
-		free(worker);
-		worker = NULL;
+			pthread_mutex_lock(&(pool->queue_lock));
+			printf("!!! work exit, working_cnt:%d, thread:\033[1m\033[42;33m%ld\033[0m, func address:%p\n", pool->working_cnt, pthread_self(), worker->process_work);
+			pool->working_cnt--;
+			pthread_mutex_unlock(&(pool->queue_lock));
+
+			free(worker);
+			worker = NULL;
+		} else {
+			printf("no worker..................\n");	
+		}
 	}
 
 	pthread_exit(NULL);
@@ -414,37 +447,50 @@ void* thread_routine(void *args)
 
 void *work(void *args)
 {
-	int i=0;
 	int sock_fd = *(int *)args;
 	char buf[1024];
 	int ret;
+	int i = 0;
 
-	printf("thread %ld working, tcpfd=%d, count:%d\n", pthread_self(), sock_fd, i++);
+	printf("thread \033[1m\033[42;33m%ld \033[0m working, connfd=%d\n\n\n", pthread_self(), sock_fd);
 
 	while (1) {
 		memset(buf, '\0', 1024);
 		ret = recv(sock_fd, buf, 1024, 0);
-		if( ret < 0 ) {
-			if( (errno != EAGAIN ) || ( errno != EWOULDBLOCK )) {
+		if( ret <= 0 ) {
+			if (errno == ECONNRESET) {
+				printf("errno ECONRESET!\n");	
+			}
+			if (errno == EBADF) {
+				printf("errno EBADF\n");
+			}
+			if( (errno != EAGAIN ) || ( errno != EWOULDBLOCK ) /*|| errno != EINTR*/) {
+				printf("%s %d, recv error\n", __func__, __LINE__);
 				perror("tcp recv");
-				close(sock_fd);
 				break;
 			}
-		} else if(ret == 0) {
-			perror("tcp recv");
-			printf("%s %d, recv error\n", __func__, __LINE__);
-			close(sock_fd);
-		} else {
-			printf("tcp recv %d bytes:%s\n", ret, buf);
-			send(sock_fd, buf, ret, 0);
+		}// else if(ret == 0) {
+		 //	perror("tcp recv");
+		 //	printf("%s %d, recv error\n", __func__, __LINE__);
+		 //	close(sock_fd);
+		 //} 
+		else {
+			//printf("tcp recv %d bytes:%s\n", ret, buf);
+			sprintf(buf, "working, connfd=%d, cnt:%d\n", sock_fd, i++);
+			ret = send(sock_fd, buf, strlen(buf), 0);
+			if (ret < 0) {
+				perror("tcp send:");	
+			}
 		}
 	}
 
 	pthread_mutex_lock(&(g_manager.conn_lock));
 	conn_free(sock_fd);
+	close(sock_fd);
+	g_manager.nconnections--;
 	pthread_mutex_unlock(&(g_manager.conn_lock));
 
-	printf("thread %ld func exit!!!\n", pthread_self());
+	printf("thread %ld func work func exit!!!\n", pthread_self());
 	return NULL;
 }
 
@@ -465,6 +511,7 @@ thread_pool_t *threadpool_init( int max_thread_num)
 	return pool;
 }
 
+
 int main(int argc, char **argv)
 {
 	int ret = 0;
@@ -472,12 +519,14 @@ int main(int argc, char **argv)
 	usleep(1000*1);
 
 	g_manager.conn = (connections_t *)malloc(sizeof(connections_t )*MAX_EVENT_NUMBER);
+	g_manager.nconnections = 0;
 	conn_init(g_manager.conn, MAX_EVENT_NUMBER);
 
 	pthread_mutex_init(&(g_manager.conn_lock), NULL);
 
 	g_manager.ep_events = (struct epoll_event *)malloc(sizeof(struct epoll_event)*MAX_EVENT_NUMBER);
 	g_manager.ep_fd = epoll_create(MAX_EVENT_NUMBER);
+	g_manager.max_ep_events = 4096;
 	if (g_manager.ep_fd < 0) {
 		perror("epoll create error");
 		return -1; 
@@ -499,7 +548,7 @@ int main(int argc, char **argv)
 		perror("tcp sock");
 		return -1;
 	}
-	printf("tcpfd:%d\n", tcpfd);
+	printf("sockfd:%d\n", tcpfd);
 
 	int opt=1;
 	setsockopt(tcpfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -513,8 +562,8 @@ int main(int argc, char **argv)
 	bzero(&address, sizeof(address));
 	address.sin_family = AF_INET;
 	address.sin_port = htons(SERV_PORT);
-	//address.sin_addr.s_addr = inet_addr(ip);
-	address.sin_addr.s_addr = htonl(INADDR_ANY);
+	address.sin_addr.s_addr = inet_addr("192.168.1.227");
+	//address.sin_addr.s_addr = htonl(INADDR_ANY);
 
 	ret = bind(tcpfd, (struct sockaddr*)&address, sizeof(address));
 	if (ret < 0) {
@@ -528,14 +577,13 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
-	//accept
-	if (conn_set(tcpfd, EPOLLIN, (void *)add_conn) < 0) {
+	if (conn_set(tcpfd, EPOLLIN, NULL) < 0) {
 		fprintf(stderr, "listen fd:conn set error\n");
 		return -1;
 	} 
 	
 	while (1) {
-		int event_count = epoll_wait(g_manager.ep_fd, g_manager.ep_events, MAX_EVENT_NUMBER, -1);
+		int event_count = epoll_wait(g_manager.ep_fd, g_manager.ep_events, g_manager.max_ep_events, -1);
 		if(event_count < 0) {
 			perror("epoll wait error");
 			return -1;	
@@ -550,15 +598,28 @@ int main(int argc, char **argv)
 				printf("ev_conn = 0\n");
 				continue;
 			}
+			printf("epoll event: 0x%x, EPOLLRDHUP:0x%x, EPOLLIN:0x%x, EPOLLOUT:0x%x\n", events, EPOLLRDHUP, EPOLLIN, EPOLLOUT);
+			if (events & EPOLLRDHUP) {
+				printf("epoll event EPOLLRDHUP\n");
+			}
+			if (events & EPOLLERR) {
+				printf("epoll event EPOLLERR\n");	
+			}
 			if (events & EPOLLIN) {
 				if (fd == tcpfd) {
 					printf("%s %d accept\n", __func__, __LINE__);			
+					accept_connect((void *)&fd);
 				}
 				if (ev_conn->read) {
-					event_t *read_ev = ev_conn->read;
-					printf("epoll read event fd: %d, events:%d\n", read_ev->ev_fd, read_ev->ev_events);	
+					event_t *read_ev = ev_conn->read;	
+					printf("epoll read event fd: %d, events:%x\n", read_ev->ev_fd, read_ev->ev_events);	
+					if (g_manager.conn[fd].used_bit) {
+						continue;
+					}
 					if (read_ev->ev_callback) { 
 						read_ev->ev_callback(read_ev->ev_fd, read_ev->ev_events, read_ev->ev_arg);
+					} else {
+						printf("call back NULL\n");
 					}
 				}   
 			}   
