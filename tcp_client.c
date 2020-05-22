@@ -22,7 +22,7 @@ void *recv_func(void* arg)
 	while (1) {
 		len = recv(sockfd, buf, BUFF_LEN, 0);
 		if (len > 0) {
-			printf("recv server: %s\n", buf);
+			printf("recv server %d bytes: %s\n", len, buf);
 		} else if (len < 0) {
 			perror("recv data error\n");
 			close(sockfd);
