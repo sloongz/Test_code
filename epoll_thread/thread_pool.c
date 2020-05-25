@@ -166,7 +166,7 @@ static void *threadpool_thread(void *threadpool)
 
 		//如果没有任务的话,则阻塞在该条件变量上
 		while ((pool->queue_size == 0) && (!pool->shutdown)) {
-			printf("thread %ld is waiting\n", pthread_self());
+			printf("thread %ld is waiting, busy_thread_num:%d\n", pthread_self(), pool->busy_thread_num);
 
 			pthread_cond_wait(&(pool->queue_not_empty), &(pool->struct_lock));
 

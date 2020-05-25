@@ -31,8 +31,8 @@ void addfd(int epollfd, int fd)
 {
 	struct epoll_event event;
 	event.data.fd = fd;
-	//event.events = EPOLLIN | EPOLLET;
-	event.events = EPOLLIN;
+	event.events = EPOLLIN | EPOLLET;
+	//event.events = EPOLLIN;
 	epoll_ctl( epollfd, EPOLL_CTL_ADD, fd, &event );
 	setnonblocking( fd );
 }
@@ -123,6 +123,7 @@ int main( int argc, char* argv[] )
 			int sockfd = events[i].data.fd;
 			if (sockfd == tcpfd)
 			{
+				printf("trgger---> fd:%d evnet:EPOLLIN\n", sockfd);
 				struct sockaddr_in client_address;
 				socklen_t client_addrlength = sizeof( client_address );
 				int connfd = accept(tcpfd, ( struct sockaddr* )&client_address, &client_addrlength);
